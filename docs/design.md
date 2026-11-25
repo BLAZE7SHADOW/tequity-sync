@@ -169,6 +169,25 @@ CREATE TABLE sync_state (key text PRIMARY KEY, value jsonb);  -- reconcile water
 The SQL form of steps 5–7 is one statement, so concurrent replicas cannot interleave:
 `INSERT … ON CONFLICT (portal_id, field) DO UPDATE SET … WHERE (field_state.stamp_time, field_state.stamp_event_id) < (EXCLUDED.stamp_time, EXCLUDED.stamp_event_id)`. If 0 rows are updated, the outcome is `superseded`.
 
+## 5. Inbound path: webhook → Postgres
+
+Endpoint `POST /webhooks/salesforce`, any replica:
+
+1. **Authenticate.** Check the HMAC-SHA256 of the raw body against `X-Signature`. Reject if `X-Timestamp` is more than 5 min from now. Failure → `401`, nothing stored.
+2. **Validate.** Required: `eventId`, `recordId`, `objectType ∈ {Account, Contact}`, `occurredAt` (ISO-8601 with ms), `changedBy`, and a `changedFields` object. Failure → `400`, logged.
+3. **Map fields.** Map Salesforce fields to ours (Q12). Fields outside the 8 in scope are ignored and logged, not rejected, because Salesforce may send more. If no in-scope field remains, the event is still recorded in the inbox and gets `200`.
+4. **Open one transaction.** Steps 4a–4e run inside it:
+   - a. `INSERT INTO inbox_events (event_id, …) VALUES ($eventId, …) ON CONFLICT DO NOTHING RETURNING event_id`. **No row returned → duplicate**: `COMMIT`, `200`, stop (§8).
+   - b. Resolve the record. Look up `records` by `sf_id = recordId`. If not found and `portalId` is present, look up by `portal_id` and set `sf_id` (this is the echo of our own create). If still not found, insert a new `records` row: a Salesforce-side create.
+   - c. `SELECT … FROM records WHERE portal_id=$1 FOR UPDATE`. This serialises all writers of one record: replicas, the portal API and the worker.
+   - d. For each field, run `merge(S, E)` (§4), with `E = {value, stamp=(occurredAt, eventId), actor=changedBy, source='salesforce'}`. Append one `field_events` row per field, always, whatever the outcome.
+   - e. `UPDATE records SET sf_modstamp = GREATEST(sf_modstamp, $systemModstamp)`.
+5. **Commit, then answer.** `COMMIT` → `200`. Any database error → `ROLLBACK` → `503`. The inbox row rolls back too, so Salesforce's retry is applied, not mistaken for a duplicate.
+
+**The inbound path never inserts into `outbox`.** This is loop layer (a), §9.
+
+Load: 30 webhooks/s at peak × ~3 statements per field. That is well inside one Postgres primary. The endpoint holds no state, so replicas are added for availability, not throughput.
+
 ## 7. The rule when both sides change the same record
 
 - **Different fields, any sides:** each field has its own `field_state` row and its own stamp, so both edits survive. Brief example: finance sets city=Noida at 11:00, sales sets phone at 11:30. The rows are independent and both values stay current. `city.actor=finance.user`, `phone.actor=sales.user`.
@@ -179,3 +198,30 @@ The SQL form of steps 5–7 is one statement, so concurrent replicas cannot inte
   - *Salesforce wins.* `value = sf_value`, so the worker finds nothing to send for that field and the queued portal value is never sent.
   - *Sales edit while our PATCH is in flight.* Handled by `If-Unmodified-Since` (§6).
 - **Opposite case: equal stamps.** Both time and event id equal means it is the same event, which the inbox rejects first. Equal times with different ids are ordered by the id string. That order is arbitrary but deterministic, so every replica decides the same way.
+
+## 8. Duplicate webhook; older webhook after a newer one
+
+**Duplicate rule.** The key is `inbox_events.event_id` (PRIMARY KEY = webhook `eventId`). The second delivery inserts 0 rows, so nothing else runs: no history row, no state change, and the answer is `200` so Salesforce stops retrying. Edge cases:
+- Two copies arrive at once on two replicas. The second `INSERT` blocks on the first's uncommitted key.
+  - First commits → the second sees a conflict and does nothing.
+  - First rolls back → the second inserts and applies. Exactly one applies either way.
+- Same `eventId`, different body. Still a duplicate, but we compare a SHA-256 of the body with the stored payload. A mismatch logs `inbox_payload_mismatch` and alerts, because it means Salesforce reused an id.
+
+**Out-of-order rule.** The key is the per-field stamp `(occurredAt, eventId)`. An event whose stamp is ≤ the field's current stamp does not change `value`. It is appended to `field_events` with `outcome='superseded'`, so the older edit and its author stay in history. Only the 0-or-1-row conditional upsert decides, so arrival order never matters.
+
+**Worked example.** Contact `0031A00000Abc`, starting state:
+- `phone = +911111111111`, stamp `(11:00:00.000, evt_0990)`, actor `sales.a`.
+- `city = Delhi`, stamp `(10:00, evt_0950)`.
+
+Arrivals in order:
+
+| Arrives | Event | occurredAt | Field / value | Outcome | `phone` after | actor |
+|--|--|--|--|--|--|--|
+| 1 | `evt_1001` (brief sample) | 11:30:04.000 | phone `+919876543210` by `sales.user` | stamp > (11:00, evt_0990) → `applied` | +919876543210 | sales.user |
+| 2 | `evt_1001` again | — | — | inbox conflict → **duplicate**, nothing written | +919876543210 | sales.user |
+| 3 | `evt_1000` (late) | 11:20:00.000 | phone `+918888888888` by `sales.b` | (11:20) < (11:30:04) → `superseded`, history only | +919876543210 | sales.user |
+| 4 | portal save, finance.user | commit 11:31:10.120 | city `Noida` | different field → `applied`; outbox row inserted (portal path) | +919876543210 | city: finance.user |
+
+Final phone history: `evt_0990 applied` → `evt_1001 applied` → `evt_1000 superseded`. The brief's question "who changed the phone?" is answered by `sales.user` at 11:30:04. The fact that `sales.b` set `+918888888888` at 11:20 is kept. The city still shows Noida by finance.user.
+
+**Other case: a newer event arrives first and the older one never arrives.** Nothing is needed. The current value is already the newest one.
