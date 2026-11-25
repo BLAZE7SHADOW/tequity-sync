@@ -363,3 +363,51 @@ Our own echo is neither, so it cannot start a write. Three layers:
 **Bound.** Each portal save causes ≤ 1 write, plus ≤ 1 repair per read that finds Salesforce different. A repair's echo is an ack (b), and it is excluded from the collision trigger. A repair therefore cannot cause another repair unless a *human* edits again. The loop is bounded by human edits.
 
 **Other case: Q7 false** (the echo's `changedBy` is not our user). Layer (c) still holds in the common case: equal value → `equal_value`, actor kept. The v1/v2 case above would then flip the portal back to v1 for one round, until the next sweep sees `value(v1) = sf_value(v1)`, so v2 is silently lost. That is why Q7 is a hard prerequisite, with value-matching against `sf_value` as the fallback detector.
+
+## 10. The 6-hour Salesforce outage
+
+**Detection.** Calls fail with connection errors, timeouts or 5xx and back off (§6B). After 20 consecutive failures the breaker **opens**, and `sync_state.breaker = {state:'open', opened_at}` is written to Postgres, so a restarted process stays open and does not hammer. While open there is one probe every 30 s: 720 probes in 6 h, each costing 1 token.
+
+**What is on disk (Postgres, replicated; nothing lives only in memory).**
+
+| Data | Volume over 6 h at sustained peak | Why it is enough |
+|--|--|--|
+| Portal edits in `field_state` + `field_events` | 20 × 21,600 = 432,000 edits | The current value and full history are committed at save time; the outage changes nothing for portal users. |
+| `outbox` rows, `pending` | ≤ 432,000 (one pending row per record, so fewer if records repeat) ≈ 86 MB at ~200 B/row | This *is* the pending work. Every row survives a restart. |
+| Webhooks that do arrive (endpoint still up) | ≤ 30 × 21,600 = 648,000 | Applied normally by §5. Only *lost* ones need reconciliation. |
+| `sync_state.breaker`, `sync_state.reconcile_from` | 2 rows | Where to resume. |
+
+**Restart during the outage.** The process dies and a new leader takes the advisory lock. The breaker state is read from `sync_state` (still open, probes continue). `in_flight` rows have their lease expire (≤ 15 s) and return to `pending` with their `attempts` and `next_attempt_at` intact. The outbox is never held in memory, so **no pending call is lost**. This is demo scenario 4.
+
+**Recovery, in this order.**
+1. **Probe succeeds → half-open.** 10 rows are sent; if all succeed → **closed** and the limiter switches to **catch-up, r = 95/s**.
+2. **Reconcile first**, with the drain paused:
+   - Query `SELECT Id, <8 fields>, SystemModstamp, LastModifiedById FROM Contact|Account WHERE SystemModstamp >= :reconcile_from ORDER BY SystemModstamp`, paged at 2,000 (Q3).
+   - `reconcile_from = breaker.opened_at − 15 min`: 5 min skew margin plus 10 min for webhooks that were already in Salesforce's retry queue.
+   - Each row is applied as a **snapshot** (§4, merge step 3). Fields equal to `sf_value` are skipped. Fields that differ go through the interval rule, which moves `sf_value` and `sf_modstamp`.
+   - On completion: `reconcile_from = start time of this query − 5 min`. The query is idempotent, so a crash mid-reconcile simply re-runs it.
+3. **Drain** the outbox at 95/s, oldest `next_attempt_at` first, with the normal per-record payload (`value ≠ sf_value`). Live edits keep arriving at 20/s; edits to a record already pending coalesce into its row.
+4. Pending < 100 → steady mode, r = 70/s.
+
+**Why reconcile before draining.** If sales edits are spread uniformly, 648,000 / 5,000,000 = **12.96 %** of records were also changed in Salesforce. Draining first would send ~432,000 × 0.1296 ≈ **55,987** PATCHes against a stale `sf_modstamp`. Each one 412s and costs a GET plus a retry: 111,974 extra calls ≈ **26.7 min** at 70/s. Reconciling first costs ≈ 2.2 min and makes those PATCHes either correct or unnecessary.
+
+**Arithmetic (every division shown):**
+- Outage length: 6 h × 3,600 s = **21,600 s**.
+- Backlog (upper bound, every edit hits a different record): 20 edits/s × 21,600 s = **432,000 calls**.
+- Reconciliation, changed records: 30 × 21,600 = 648,000 records ÷ 2,000 per page = **324 calls**. 324 ÷ 95/s = **3.4 s** of API time. Applying 648,000 rows at an assumed 5,000 merges/s: 648,000 ÷ 5,000 = 129.6 s ≈ **2.2 min** (database-bound).
+- Reconciliation, absolute bound (every record changed): 5,000,000 ÷ 2,000 = 2,500 calls ÷ 95/s = 26.3 s of API time.
+- **Drain (the design):** catch-up 95/s − 20/s live writes − 5/s verification reserve = **70/s** for the backlog. 432,000 ÷ 70 = 6,171 s ÷ 60 = **102.9 min**.
+- **Total catch-up:** 3.4 s + 129.6 s + 6,171 s = 6,304 s ≈ **105.1 min**.
+
+| Variant | Net drain rate | 432,000 ÷ rate | Minutes |
+|--|--|--|--|
+| Steady target only (70 − 20) | 50/s | 8,640 s | 144.0 |
+| Catch-up, no verification reserve (95 − 20) | 75/s | 5,760 s | 96.0 |
+| **Catch-up, design (95 − 20 − 5)** | **70/s** | **6,171 s** | **102.9** |
+| Catch-up with 5 % of calls being retries (95 × 0.95 − 25) | 65.25/s | 6,621 s | 110.3 |
+| Theoretical, the full cap with no headroom (100 − 20) | 80/s | 5,400 s | 90.0 (not allowed: bucket capacity 5 caps the burst window at r + 5) |
+| Coalesced, e.g. edits hit only 100,000 distinct records | 70/s | 100,000 ÷ 70 = 1,429 s | 23.8 |
+
+The table's values are upper bounds, apart from the retry row. Coalescing only shortens the drain. Unused verification tokens flow back into the drain.
+
+**What we cannot recover.** For a record changed in Salesforce during the window whose webhooks were lost, reconciliation returns only the **latest** value, `LastModifiedById` and `SystemModstamp`. Intermediate Salesforce values from the window, and their authors, are **not recoverable** without field history (Q19). Our history records the reconciled value as `source='snapshot'`. If Salesforce later delivers delayed webhooks, they are applied normally. Older ones become `superseded`, which *adds* the missing intermediate history.
