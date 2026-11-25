@@ -26,6 +26,8 @@ Each row: the question I would ask before locking the design, the assumption I c
 | Q16 | How long must history be kept? | Forever, append-only. Upper bound 50 edits/s × 86,400 s = 4.32 M rows/day at sustained peak; real days far lower. | If a retention limit exists, partition `field_events` by month and drop old partitions. |
 | Q17 | How quickly does Salesforce send a webhook after the edit? | Within 5 s typical, 15 s worst. | If slower than ~25 s, the SF→portal 30 s bound cannot be met by us at all; that half of the SLA is theirs. |
 | Q18 | Can a Contact arrive before its Account? | Yes (any order). `customer` is stored as a reference string, `sf:<AccountId>` or `portal:<portal_id>` (for a portal-created Account not yet in Salesforce), with no FK; resolved at read time. | — |
+| Q20 | How does Salesforce count "100 requests per second"? | A sliding 1 s window over **arrival** time at Salesforce. Our one-way latency jitter is ≤ 100 ms. | If Salesforce counts per calendar second at its side, the same bound holds. If jitter is larger, catch-up `r` must drop further: r ≤ (100 − 5) ÷ (1 + δ) (§6C). |
+| Q21 | Is there also a daily API quota? | Not modelled; the brief gives only the per-second cap. | The drain alone is 432,000 + 324 = 432,324 calls, and steady state uses 25/s × 86,400 = 2.16 M/day. A lower daily quota would make the drain take days, and Bulk/Composite (§12) would become mandatory. |
 | Q19 | Can we read Salesforce field history (per-field change times)? | No, not assumed. | If yes, the "unprovable" band of §4 step 3 collapses: the history gives the true time of the Salesforce change, so every case is decided by stamp. |
 
 Decision on the brief's "Pick one"
@@ -140,6 +142,7 @@ CREATE TABLE outbox (                         -- "this record has portal edits S
   next_attempt_at timestamptz NOT NULL DEFAULT now(),
   lease_until   timestamptz,
   last_error    text,
+  last_save_at  timestamptz NOT NULL DEFAULT now(), -- latest portal save that touched this row; drives the live lane (§6C)
   created_at    timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX outbox_ready ON outbox (next_attempt_at) WHERE status = 'pending';
@@ -237,7 +240,7 @@ Load: 30 webhooks/s at peak × ~3 statements per field. That is well inside one 
 1. `SELECT … FROM records WHERE portal_id=$1 FOR UPDATE`.
 2. For each field in `changedFields`, compare `baseStamps[field]` with `field_state.stamp_event_id`. Any mismatch → `ROLLBACK`, `409` for the whole save, plus one `rejected_409` history row per field (written in a separate short transaction).
 3. Set the stamp to `(clock_timestamp(), 'p_'+uuidv7())`. Set the actor to the session user. Run `merge` (§4) and append `field_events`.
-4. `INSERT INTO outbox (portal_id) VALUES ($1) ON CONFLICT DO NOTHING`. A partial unique index `ON outbox(portal_id) WHERE status='pending'` keeps it to one pending row per record. If a row is already `in_flight`, the new pending row is the "send again afterwards".
+4. `INSERT INTO outbox (portal_id) VALUES ($1) ON CONFLICT … DO UPDATE`. On conflict: `UPDATE SET last_save_at = now()`. A partial unique index `ON outbox(portal_id) WHERE status='pending'` keeps it to one pending row per record. If a row is already `in_flight`, the new pending row is the "send again afterwards".
 5. `COMMIT` → `200`. The edit and its outbox row commit together or not at all.
 
 **B. Worker (single leader holding `pg_try_advisory_lock(42)`; 32 concurrent HTTP slots).**
@@ -271,11 +274,18 @@ Load: 30 webhooks/s at peak × ~3 statements per field. That is well inside one 
 - **Dirty sweep (convergence invariant).** *If any field has `value ≠ sf_value`, a pending or in-flight outbox row exists within 60 s.* The worker scans every 60 s, using a partial index on `field_state(portal_id) WHERE value IS DISTINCT FROM sf_value`, and inserts any missing row. This covers the one path that can make Salesforce stale without a portal save: an echo or read that shows Salesforce holding an older value than ours (§7 example, case 1b). The sweeper is a worker read path, so the webhook endpoint still never writes `outbox`.
 
 **C. Rate limiter (inside the leader).**
-- Token bucket, refill rate `r`, **capacity 5 tokens**. Any 1 s window then holds at most `r + 5` calls: 75 in steady state, 100 in catch-up. That is ≤ 100 **by construction**, even at burst.
+- Token bucket, refill rate `r`, **capacity 5 tokens**. Any 1 s window of *our* sends then holds at most `r + 5` calls: 75 in steady state, 90 in catch-up. With ≤ 100 ms jitter, Salesforce sees at most `r × 1.1 + 5` = 82 or 98.5, which is ≤ 100 **by construction**, even at burst (Q20).
 - **Every** HTTP call to Salesforce takes a token first: first attempts, retries, 412 re-reads, verification GETs (sub-cap 5/s), reconciliation pages and breaker probes.
-- **Modes.** Steady `r = 70`. Catch-up `r = 95` when outbox pending > 1,000 or right after the breaker closes; back to 70 when pending < 100.
+- **Modes.** Steady `r = 70`. Catch-up `r = 85` when outbox pending > 1,000 or right after the breaker closes; back to 70 when pending < 100.
+- **Why these rates (and why not 95).**
+  - **Retries do not need headroom above `r`.** The bucket counts every call, so retries, re-reads and probes are *inside* `r`. They can slow useful work (sensitivity rows in §10) but cannot push us over the cap. The margin between `r` and 100 is for two other things:
+    - (i) **The burst capacity** of 5 tokens.
+    - (ii) **Network jitter.** Salesforce counts *arrivals* (Q20). Requests we space over 1 s can bunch at its side, so it can see up to `r × (1 + δ) + 5` in one of its windows.
+  - **Why not 95.** At δ = 0.1 s: 95 × 1.1 + 5 = **109.5**, which breaks the cap. 85 × 1.1 + 5 = **98.5** holds. The largest safe rate is (100 − 5) ÷ 1.1 = 86.4, so **catch-up r = 85**. *Changed from 95 at the pre-Phase-9 review.*
+  - **Why steady state runs at 70, not 85.** The 30 s bound needs short queues. 25/s of steady work ÷ 70 = 35.7 % utilisation keeps token waits near zero, even when a burst of edits or a 412 wave arrives. It also leaves 15/s for Salesforce-side load we cannot see (another integration in the same org).
+- **Claim order: live lane first.** Rows touched by a portal save since the breaker last closed (`outbox.last_save_at > breaker.closed_at`) are claimed before backlog rows; within a lane, oldest `next_attempt_at` first. Without this, a live edit would wait behind up to 2 h of backlog. With it, live edits see the normal ≈ 1 s path as long as `r ≥ 25`.
 - **On 429.** `r := max(10, r/2)`, and pause until `Retry-After`. Then +5/s for every 10 s without a 429, back up to the mode's target.
-- **Throughput check.** Little's law: 95 req/s × 0.3 s typical latency ≈ 29 concurrent calls, under the 32 slots. One leader is enough.
+- **Throughput check.** Little's law: 85 req/s × 0.3 s typical latency ≈ 25.5 concurrent calls, under the 32 slots. One leader is enough.
 - **Breaker.** Opens after 20 consecutive failures (5xx, timeout or connection error). While open there are no sends, only **one probe every 30 s** (a `GET` of one known record, 1 token). Probe success → half-open: send 10 rows; all succeed → closed, catch-up mode. Any failure → open again.
 
 **D. The 30 s bound, closed.**
@@ -310,7 +320,7 @@ Echoes must be excluded from the trigger, because every send produces one echo: 
 - Worst case, where every recently sent record is edited again by sales: the per-record `verify_queue` primary key bounds reads by sends, so ≤ **20 reads/s**.
 - We **cap verification at 5 reads/s** with a sub-bucket inside the main limiter. Overflow waits in `verify_queue`, and the next reconciliation also covers it.
 - Steady state: (20 writes + 5 reads) / 70 = **35.7 %** of the target (was 28.6 %). The 30 s bound still holds.
-- **This changes the drain arithmetic (§10).** Catch-up at 95/s now spends 20 on live writes and 5 on verification, leaving 70/s for the backlog: 432,000 / 70 = 6,171 s = **102.9 min** (was 96 min). With 5 % retries: 95 × 0.95 − 25 = 65.25/s → 432,000 / 65.25 = 6,621 s = **110.3 min**. Unused verification tokens return to the drain, so these are upper bounds.
+- **This changes the drain arithmetic (§10).** Catch-up spends 20/s on live writes and reserves 5/s for verification, so the backlog gets `r − 25`. At the final catch-up rate of 85/s: 432,000 ÷ 60 = 7,200 s = **120.0 min**. Unused verification tokens flow back into the drain, so this is an upper bound.
 
 **Worked example: a sales edit at T2 lands while our PATCH from T1 is in flight.** Contact `0031A00000Abc`, field city. Clocks agree (Q6).
 
@@ -391,35 +401,51 @@ Our own echo is neither, so it cannot start a write. Three layers:
 **Restart during the outage.** The process dies and a new leader takes the advisory lock. The breaker state is read from `sync_state` (still open, probes continue). `in_flight` rows have their lease expire (≤ 15 s) and return to `pending` with their `attempts` and `next_attempt_at` intact. The outbox is never held in memory, so **no pending call is lost**. This is demo scenario 4.
 
 **Recovery, in this order.**
-1. **Probe succeeds → half-open.** 10 rows are sent; if all succeed → **closed** and the limiter switches to **catch-up, r = 95/s**.
+1. **Probe succeeds → half-open.** 10 rows are sent; if all succeed → **closed** and the limiter switches to **catch-up, r = 85/s**.
 2. **Reconcile first**, with the drain paused:
    - Query `SELECT Id, <8 fields>, SystemModstamp, LastModifiedById FROM Contact|Account WHERE SystemModstamp >= :reconcile_from ORDER BY SystemModstamp`, paged at 2,000 (Q3).
    - `reconcile_from = breaker.opened_at − 15 min`: 5 min skew margin plus 10 min for webhooks that were already in Salesforce's retry queue.
    - Each row is applied as a **snapshot** (§4, merge step 3). Fields equal to `sf_value` are skipped. Fields that differ go through the interval rule, which moves `sf_value` and `sf_modstamp`.
    - On completion: `reconcile_from = start time of this query − 5 min`. The query is idempotent, so a crash mid-reconcile simply re-runs it.
-3. **Drain** the outbox at 95/s, oldest `next_attempt_at` first, with the normal per-record payload (`value ≠ sf_value`). Live edits keep arriving at 20/s; edits to a record already pending coalesce into its row.
+3. **Drain** the outbox at 85/s, live lane first, then backlog by oldest `next_attempt_at` (§6C), with the normal per-record payload (`value ≠ sf_value`). Live edits keep arriving at 20/s; edits to a record already pending coalesce into its row.
 4. Pending < 100 → steady mode, r = 70/s.
 
-**Why reconcile before draining.** If sales edits are spread uniformly, 648,000 / 5,000,000 = **12.96 %** of records were also changed in Salesforce. Draining first would send ~432,000 × 0.1296 ≈ **55,987** PATCHes against a stale `sf_modstamp`. Each one 412s and costs a GET plus a retry: 111,974 extra calls ≈ **26.7 min** at 70/s. Reconciling first costs ≈ 2.2 min and makes those PATCHes either correct or unnecessary.
+**Why reconcile before draining.** If sales edits are spread uniformly, 648,000 / 5,000,000 = **12.96 %** of records were also changed in Salesforce. Draining first would send ~432,000 × 0.1296 ≈ **55,987** PATCHes against a stale `sf_modstamp`. Each one 412s and costs a GET plus a retry: 111,974 extra calls ÷ 60/s net drain = 1,866 s ≈ **31.1 min**. Reconciling first costs ≈ 2.2 min and makes those PATCHes either correct or unnecessary.
 
 **Arithmetic (every division shown):**
 - Outage length: 6 h × 3,600 s = **21,600 s**.
 - Backlog (upper bound, every edit hits a different record): 20 edits/s × 21,600 s = **432,000 calls**.
-- Reconciliation, changed records: 30 × 21,600 = 648,000 records ÷ 2,000 per page = **324 calls**. 324 ÷ 95/s = **3.4 s** of API time. Applying 648,000 rows at an assumed 5,000 merges/s: 648,000 ÷ 5,000 = 129.6 s ≈ **2.2 min** (database-bound).
-- Reconciliation, absolute bound (every record changed): 5,000,000 ÷ 2,000 = 2,500 calls ÷ 95/s = 26.3 s of API time.
-- **Drain (the design):** catch-up 95/s − 20/s live writes − 5/s verification reserve = **70/s** for the backlog. 432,000 ÷ 70 = 6,171 s ÷ 60 = **102.9 min**.
-- **Total catch-up:** 3.4 s + 129.6 s + 6,171 s = 6,304 s ≈ **105.1 min**.
+- Reconciliation, changed records: 30 × 21,600 = 648,000 records ÷ 2,000 per page = **324 calls**. 324 ÷ 85/s = **3.8 s** of API time. Applying 648,000 rows at an assumed 5,000 merges/s: 648,000 ÷ 5,000 = 129.6 s ≈ **2.2 min** (database-bound).
+- Reconciliation, absolute bound (every record changed): 5,000,000 ÷ 2,000 = 2,500 calls ÷ 85/s = 29.4 s of API time.
+- **Drain (the design):** catch-up 85/s − (20/s live writes + 5/s verification reserve = 25/s) = **60/s** for the backlog. 432,000 ÷ 60 = 7,200 s ÷ 60 = **120.0 min**.
+- **Total catch-up:** 3.8 s + 129.6 s + 7,200 s = 7,333 s ÷ 60 ≈ **122.2 min**.
 
-| Variant | Net drain rate | 432,000 ÷ rate | Minutes |
-|--|--|--|--|
-| Steady target only (70 − 20) | 50/s | 8,640 s | 144.0 |
-| Catch-up, no verification reserve (95 − 20) | 75/s | 5,760 s | 96.0 |
-| **Catch-up, design (95 − 20 − 5)** | **70/s** | **6,171 s** | **102.9** |
-| Catch-up with 5 % of calls being retries (95 × 0.95 − 25) | 65.25/s | 6,621 s | 110.3 |
-| Theoretical, the full cap with no headroom (100 − 20) | 80/s | 5,400 s | 90.0 (not allowed: bucket capacity 5 caps the burst window at r + 5) |
-| Coalesced, e.g. edits hit only 100,000 distinct records | 70/s | 100,000 ÷ 70 = 1,429 s | 23.8 |
+Useful rate = `r × (1 − retry fraction)`. Reserve = 20 live + 5 verification = 25/s. Net = useful − reserve.
 
-The table's values are upper bounds, apart from the retry row. Coalescing only shortens the drain. Unused verification tokens flow back into the drain.
+| Variant | Useful rate | Net drain rate | 432,000 ÷ net | Minutes |
+|--|--|--|--|--|
+| Steady target only | 70 | 70 − 25 = 45/s | 9,600 s | 160.0 |
+| **Catch-up, design** | **85** | **85 − 25 = 60/s** | **7,200 s** | **120.0** |
+| Catch-up, 5 % of calls are retries | 85 × 0.95 = 80.75 | 55.75/s | 7,749 s | 129.1 |
+| Catch-up, 10 % retries | 85 × 0.90 = 76.5 | 51.5/s | 8,388 s | 139.8 |
+| Catch-up, 20 % retries | 85 × 0.80 = 68 | 43/s | 10,047 s | 167.4 |
+| **429 burst: limiter halves 85 → 42.5**, reserve kept | 42.5 | 42.5 − 25 = 17.5/s | 24,686 s | 411.4 |
+| 429 burst, verification shed (reserve = 20 live only) | 42.5 | 42.5 − 20 = 22.5/s | 19,200 s | 320.0 |
+| 429 persists, second halving to 21.25, verification shed | 21.25 | 1.25/s | 345,600 s | 5,760 (96 h) |
+| Old design, catch-up 95 (rejected: 109.5 at Salesforce, §6C) | 95 | 70/s | 6,171 s | 102.9 |
+| Coalesced: edits hit only 100,000 distinct records | 85 | 60/s | 100,000 ÷ 60 = 1,667 s | 27.8 |
+
+**If 429s persist.** Salesforce is telling us that the org's real budget is smaller than ours, for example because another integration shares it.
+1. **Page.** §11 #2 fires at ≥ 10 × 429 in a minute. The on-call asks the client who else is calling, and whether the limit can be raised.
+2. **Shed what can wait.**
+   - When `r < 50`, the verification reserve goes to 0. Collisions fall back to the next reconciliation, which runs every 15 min while shedding.
+   - Reconciliation pages are deferred until `r` recovers. Only 324 calls, but they compete with live edits.
+3. **Never drop edits.** Rows stay `pending`; "slow down and keep the work" (brief).
+4. **Live edits in this mode.** The live lane is served first, so at `r = 42.5` live work is 20 ÷ 42.5 = 47 % utilisation (58.8 % with the verification reserve). Live edits still land in ≈ 1–2 s and the **30 s target holds**; only the backlog slows.
+   - At `r = 21.25` (second halving), live writes alone use 20 of 21.25. Queueing delay rises sharply, but the target still holds while `r ≥ 20`.
+   - Below 20/s (the limiter floor is 10), live edits queue at `20 − r` per second, so the **30 s target is broken by Salesforce's throttling**. The oldest-unsent alert (§11 #1) fires within 5 min.
+
+The values without retries or 429s are upper bounds. Coalescing only shortens the drain. Unused verification tokens flow back into the drain.
 
 **What we cannot recover.** For a record changed in Salesforce during the window whose webhooks were lost, reconciliation returns only the **latest** value, `LastModifiedById` and `SystemModstamp`. Intermediate Salesforce values from the window, and their authors, are **not recoverable** without field history (Q19). Our history records the reconciled value as `source='snapshot'`. If Salesforce later delivers delayed webhooks, they are applied normally. Older ones become `superseded`, which *adds* the missing intermediate history.
 
@@ -428,7 +454,7 @@ The table's values are upper bounds, apart from the retry row. Coalescing only s
 | # | Number (how it is computed) | Normal | Page when | Why that value |
 |--|--|--|--|--|
 | 1 | **Oldest unsent outbox age** = `now() − min(created_at)` over `status IN ('pending','in_flight')` | ≈ 1 s (§6D) | **> 20 s for 5 min** while the breaker is closed | 20 s leaves 10 s before the 30 s bound is broken. 5 min filters out a single slow retry chain. While the breaker is open, page instead on **breaker open > 5 min**: that is the outage itself. |
-| 2 | **Salesforce call rate**, every call counted at `limiter.take()`, and **429s per minute** | 25/s (20 writes + verification) | **> 85/s for 5 min in steady mode**, or **≥ 10 × 429 in a minute** | At a 70/s target, a sustained 85/s means something is bypassing the target (a retry storm or a bug). Repeated 429s mean Salesforce sees a different budget than ours, for example another integration sharing the org's limit. |
+| 2 | **Salesforce call rate**, every call counted at `limiter.take()`, and **429s per minute** | 25/s (20 writes + verification) | **Mode-aware: > r_mode + 15 for 5 min**, i.e. **> 85/s in steady mode (r = 70)** and **> 100/s in catch-up (r = 85)**; or **≥ 10 × 429 in a minute** | A fixed 85/s threshold would fire on every recovery, because catch-up runs at 85/s with bursts to 90/s. The bucket bounds our own 1 s windows at `r + 5` (75 steady, 90 catch-up), so exceeding `r + 15` means a call path bypasses the limiter: a bug, not load. Repeated 429s mean Salesforce sees a different budget than ours, for example another integration sharing the org's limit. |
 | 3 | **Minutes since the last webhook** | seconds | **> 10 min, 09:00–19:00 client time** | Quiet hour = 1 edit/s, × 0.6 from Salesforce = 360 expected webhooks in 10 min. Seeing none is not chance: delivery is broken or our endpoint is rejecting. Runs reconciliation automatically, as well as paging. |
 | 4 | **Clock skew**: 5-min median of `max(0, t_send − occurredAt, occurredAt − t_ack)` over our echoes (Q6) | 0 s | **> 1 s for 10 min** | 1 s = ε. Above it, interval-rule verdicts (§4 step 3) and cross-side same-field ordering can be wrong. Automatic action: set ε = 2 × measured skew until fixed. |
 
@@ -438,7 +464,7 @@ Also paged, but not part of the three-plus-one: **any `dead` outbox row** (an ed
 
 - **Deletes and Salesforce record merges** (out of scope per the brief). A merged Account would orphan Contacts' `customer` ids, and a delete would leave `outbox` rows that 404 into `dead`.
 - **The conflict-review UI.** The data exists (`conflict` flag, both values in `field_events`). The screen does not.
-- **Bulk / Composite API.** These are the main lever if the drain must be faster: 25 records per Composite call would divide the 102.9 min by up to 25. Not assumed, so not used in the arithmetic.
+- **Bulk / Composite API.** These are the main lever if the drain must be faster: 25 records per Composite call would divide the 120.0 min by up to 25. Not assumed, so not used in the arithmetic.
 - **Verifying assumptions Q3, Q8, Q9, Q14 and Q19 against a real org**, and a load test against real Salesforce (out of scope).
 - **Postgres HA, backups, a second region.** Assumed managed, with a single primary.
 - **Owner-id mapping maintenance** (Q12), field-level security, PII encryption at rest, and secret rotation for the webhook HMAC.
