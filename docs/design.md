@@ -13,9 +13,9 @@ Each row: the question I would ask before locking the design, the assumption I c
 | Q3 | Can we ask Salesforce what changed during the 6 h? | **Yes**: a query by `SystemModstamp >= watermark − 5 min`, 2,000 rows per page (SOQL query + queryMore). Assumption. | If not: changes made in Salesforce during the window whose webhooks were lost stay unknown until the next edit of that record, or a full 5 M-record export (2,500 pages). Intermediate values inside the window are unrecoverable **either way** — the query returns only the latest value. |
 | Q4 | Two portal users edit the same field: what does the other see, what goes to SF? | Optimistic concurrency per field. The form submits the stamp (`stamp_event_id`) it loaded. If the field's current stamp differs → **409** with the current value, who set it, when. The loser's attempt is written to history as `rejected`. **Only the winner is sent to Salesforce.** | If the client prefers silent last-write-wins: drop the 409, the later commit wins, the earlier value stays in history. Outbound is unchanged. |
 | Q5 | What orders a portal edit (sample has no time)? | **Server commit timestamp** from Postgres (`clock_timestamp()` inside the write transaction) plus a server-generated `event_id`. **Actor = authenticated session user**; `editedBy` in the payload is ignored (rejected with 400 if it disagrees with the session). | If the client insists on a client-side time, we would need skew bounds per browser; I would refuse and keep server time. |
-| Q6 | How far apart are Salesforce's clock (`occurredAt`) and ours? | Both NTP-synced, **skew < 1 s**. | Cross-side edits of the **same field** within the skew window can resolve in the wrong order. Larger skew → add a rule "within N s, Salesforce wins" and flag for review. Different-field edits are unaffected. |
+| Q6 | How far apart are Salesforce's clock (`occurredAt`) and ours? | Both NTP-synced, **skew < 1 s** (margin ε = 1 s in §4 step 3). **Measured, not trusted.** Every echo of our own PATCH must have an `occurredAt` inside `[t_send, t_ack]` of our call, both read on our clock. Provable skew per echo = `max(0, t_send − occurredAt, occurredAt − t_ack)`. Its 5-min median is a watched number (§11). | Cross-side edits of the **same field** within the skew window can resolve in the wrong order. Larger skew → add a rule "within N s, Salesforce wins" and flag for review. Different-field edits are unaffected. |
 | Q7 | Does `changedBy` identify our integration user on echoes? | Yes. We call Salesforce as one dedicated user, `integration@tequity.example`, which appears as `changedBy`. | Loop layer (b) fails; layers (a) and (c) still stop the loop (§9), but the echo would be recorded as a normal SF edit with the wrong actor. Fallback: match the echo value against the last value we sent (`sf_value`). |
-| Q8 | Does the record API support conditional update (`If-Unmodified-Since` → 412)? | **Yes** (assumption). Used to avoid overwriting a sales edit that landed while our PATCH was queued. | Without it, a same-field cross-side race can leave Salesforce on the older value until reconciliation repairs it (§7, §10). |
+| Q8 | Does the record API support conditional update (`If-Unmodified-Since` → 412)? | **Yes** (assumption). Used to avoid overwriting a sales edit that landed while our PATCH was queued. The header is an HTTP-date, which has **1 s resolution**, so a sales edit in the same second as our base is not caught. The collision check (§7) covers that gap. | Without it, a same-field cross-side race can leave Salesforce on the older value until reconciliation repairs it (§7, §10). |
 | Q9 | Can we add an External ID field to Account and Contact? | Yes: `Portal_Id__c` (unique, external ID). Portal creates use **upsert by `Portal_Id__c`**, so a retried create cannot duplicate. | Without it, a create that times out and is retried may duplicate; we would query by `Portal_Id`-like natural key before each retry (+1 call per retry). |
 | Q10 | How are webhooks authenticated? | HMAC-SHA256 of the raw body in header `X-Signature`, shared secret, plus a timestamp header rejected if > 5 min old. | If only a static token is available: token in header + IP allowlist; replay protection then relies on `inbox_events` only. |
 | Q11 | Does Salesforce retry a webhook on non-2xx, and how long? | Yes, with backoff for at least 1 h. We return 200 **only after commit**. | If no retry, any 5xx from us loses the event; reconciliation (§10) must also run on a schedule (every 15 min), not only after outages. |
@@ -25,6 +25,7 @@ Each row: the question I would ask before locking the design, the assumption I c
 | Q15 | Is our webhook endpoint also down during the 6 h? | No. Only the Salesforce API is unreachable; Salesforce's webhook sends **may** fail too and are not guaranteed to be retried (brief). | If our endpoint is down too, same recovery path (§10); nothing new. |
 | Q16 | How long must history be kept? | Forever, append-only. Upper bound 50 edits/s × 86,400 s = 4.32 M rows/day at sustained peak; real days far lower. | If a retention limit exists, partition `field_events` by month and drop old partitions. |
 | Q17 | How quickly does Salesforce send a webhook after the edit? | Within 5 s typical, 15 s worst. | If slower than ~25 s, the SF→portal 30 s bound cannot be met by us at all; that half of the SLA is theirs. |
+| Q19 | Can we read Salesforce field history (per-field change times)? | No, not assumed. | If yes, the "unprovable" band of §4 step 3 collapses: the history gives the true time of the Salesforce change, so every case is decided by stamp. |
 | Q18 | Can a Contact arrive before its Account? | Yes (any order). `customer` is stored as the Salesforce Account ID string, no FK; resolved at read time. | — |
 
 Decision on the brief's "Pick one": **delta webhooks** (Q2), with the snapshot rule as the defined behaviour for the other case.
@@ -82,9 +83,9 @@ Shared code, `applyFieldEvents(tx, recordKey, events[])`, is the **only** functi
 1. **Per-field merge and ordering** (pure function `merge(state, event) → {state', historyRow}`). Riskiest because every path calls it, and a bug loses data silently with no error. Cheapest to prove: unit tests, no I/O. Needs: the stamp definition. No component.
 2. **Idempotent inbound apply** (duplicate and out-of-order in one transaction). Second because Salesforce *will* duplicate and reorder from day one. Needs: `inbox_events` (PK `event_id`) and a conditional upsert.
 3. **Loop prevention.** A loop costs the rate budget at 2× per bounce and corrupts the actor. Must exist before the worker sends anything. Needs: integration-user identity and the `sf_value` column. No component.
-4. **Durable outbound queue.** "Pending calls survive restart" is a hard requirement. Needs: the `outbox` table written in the portal's save transaction, plus leases. Adds the **worker** deployable.
-5. **Rate limiter, backoff, breaker.** The cap counts retries, so the limiter must wrap every attempt. Needs: an in-process token bucket in the single leader. Adds the **advisory lock** (leader election without new infrastructure).
-6. **Cross-side race on an in-flight update** (sales edit lands while our PATCH is queued). Needs: `If-Unmodified-Since` (Q8) and the 412 path.
+4. **Cross-side race on an in-flight update** (a sales edit lands while our PATCH is queued or in flight). Moved ahead of the queue at the Phase 2 review because it fixes the **payload format**: values are computed from `field_state` at send time, `If-Unmodified-Since: sf_modstamp` is attached, and a collision check feeds a read-only `verify_queue`. Needs: Q8, plus the `verify_queue` table.
+5. **Durable outbound queue.** "Pending calls survive restart" is a hard requirement. Needs: the `outbox` table written in the portal's save transaction, plus leases. Adds the **worker** deployable.
+6. **Rate limiter, backoff, breaker.** The cap counts retries, so the limiter must wrap every attempt. Needs: an in-process token bucket in the single leader. Adds the **advisory lock** (leader election without new infrastructure).
 7. **Creates and ID mapping.** Retried creates must not duplicate, and a create's echo must find its row. Needs: `Portal_Id__c` upsert and `portalId` in the webhook.
 8. **Outage recovery.** Drain plus reconciliation of lost webhooks. Needs: the `sync_state.watermark` and query API (Q3). Built late because it reuses 2, 4 and 5 unchanged.
 9. **Observability.** Three paging metrics (§11).
@@ -98,7 +99,8 @@ CREATE TABLE records (
   portal_id    uuid PRIMARY KEY,              -- = Portal_Id__c in Salesforce
   sf_id        text UNIQUE,                   -- NULL until our create is acked
   object_type  text NOT NULL CHECK (object_type IN ('Account','Contact')),
-  sf_modstamp  timestamptz                    -- latest SystemModstamp seen; base for If-Unmodified-Since
+  sf_modstamp  timestamptz,                   -- latest SystemModstamp seen; base for If-Unmodified-Since
+  last_send_ack_at timestamptz                 -- end of our last successful write; collision window = in flight or ack + 10 s
 );
 
 CREATE TABLE field_state (                    -- one row per (record, field): the CURRENT value
@@ -111,7 +113,8 @@ CREATE TABLE field_state (                    -- one row per (record, field): th
   changed_at     timestamptz NOT NULL,        -- when the value last changed (display)
   source         text NOT NULL,               -- portal | salesforce | snapshot
   sf_value       jsonb,                       -- last value we know Salesforce holds
-  sf_stamp       timestamptz,                 -- occurredAt / ack time of sf_value
+  sf_stamp       timestamptz,                 -- W: last time we KNEW Salesforce held sf_value for this field
+  conflict       boolean NOT NULL DEFAULT false, -- set by the unprovable case of merge step 3
   PRIMARY KEY (portal_id, field)
 );
 
@@ -119,7 +122,7 @@ CREATE TABLE field_events (                   -- append-only history; never UPDA
   id          bigserial PRIMARY KEY,
   portal_id   uuid, field text, value jsonb,
   stamp_time  timestamptz, event_id text, actor text, source text,
-  outcome     text NOT NULL,  -- applied | superseded | equal_value | echo_ack | rejected_409 | pending_wins
+  outcome     text NOT NULL,  -- applied | superseded | equal_value | echo_ack | rejected_409 | unprovable
   recorded_at timestamptz NOT NULL DEFAULT now()
 );
 
@@ -136,6 +139,11 @@ CREATE TABLE outbox (                         -- "this record has portal edits S
   created_at    timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX outbox_ready ON outbox (next_attempt_at) WHERE status = 'pending';
+
+CREATE TABLE verify_queue (                   -- read-only verification requests; NOT the outbox (loop layer a)
+  portal_id uuid PRIMARY KEY,                 -- PK = at most one pending read per record
+  due_at    timestamptz NOT NULL DEFAULT now()
+);
 
 CREATE TABLE sync_state (key text PRIMARY KEY, value jsonb);  -- reconcile watermark, breaker
 ```
@@ -155,12 +163,37 @@ CREATE TABLE sync_state (key text PRIMARY KEY, value jsonb);  -- reconcile water
 
 1. **Echo.** If `E.source='salesforce'` and `E.actor = integration@tequity.example`: set `sf_value=E.value`, `sf_stamp=E.stamp_time`. Leave `value`, `actor` and stamp unchanged. History `echo_ack`.
 2. **Track Salesforce.** For any other Salesforce or snapshot event with `E.stamp_time > sf_stamp`: set `sf_value=E.value`. This happens whatever step 3 decides.
-3. **Pending wins.** This step applies only to a snapshot (full-record or reconciliation) event whose field also has an unsent portal edit. "Unsent" means `S.source='portal'` and `S.value ≠ sf_value`.
-   - Keep `value`.
-   - Record history `pending_wins`.
-   - Increment the `reconcile_conflicts` counter.
+3. **Snapshot against an unsent portal edit: interval rule.** This replaces "pending always wins", which the Phase 2 review rejected: it picks the portal value even when the portal edit is the older one. The rule applies only when all three hold:
+   - E is a snapshot: a full-record webhook, a reconciliation row or a verification read.
+   - `E.value ≠ sf_value`, so Salesforce changed the field since we last knew its value.
+   - The field holds an unsent portal edit (`S.source='portal'` and `S.value ≠ sf_value`), with time `P = S.stamp_time`.
 
-   Why: the portal edit has a true per-field time, and the snapshot only has a record-level time (agreed at the Phase 2 review).
+   The Salesforce change happened somewhere in **(W, M]**:
+   - **W** = `field_state.sf_stamp`, the last time we knew Salesforce held `sf_value` *for this field*.
+   - **M** = the record's `SystemModstamp` (for a full-record webhook, its `occurredAt`).
+   - **ε** = 1 s skew margin (Q6).
+
+   | Case | Condition | Result |
+   |--|--|--|
+   | Portal provably later | `P > M + ε` | Keep `value`. E is recorded `superseded`. The outbox sends the portal value. |
+   | Salesforce provably later | `P ≤ W − ε` | Apply E with stamp `(M, snap id)`. Since `M > W > P`, it beats P. `value = sf_value` now, so the queued portal value is never sent. |
+   | Unprovable | otherwise | Keep the portal value as the current one, as a **reversible tie-break**. Set `field_state.conflict = true` and record E as `unprovable` (both values are in history). Increment `reconcile_conflicts`. The outbox sends the portal value, so both sides converge on it. A reviewer settles it with a normal portal save, which clears the flag. |
+
+   **W is per field, not per record.** A delta webhook for `phone` at 09:30 proves nothing about `city`. A record-level W = 09:30 would wrongly turn a 09:00 portal city edit into "Salesforce wins", even if the lost sales city change was at 08:30.
+
+   **If the M assumption is wrong.** `SystemModstamp` also advances on system-only updates. That makes M *later* than the true change, so the band gets wider: more flags, but never a wrong verdict. The rule is unsafe only if M is *earlier* than the true change, or if skew exceeds ε. Then a "portal provably later" verdict could be false. The skew metric (§11) detects the second cause. The fallback is to set ε very large, which sends every case to "unprovable".
+
+   **Worked examples** (Contact city):
+
+   | | W (`sf_stamp`) | M (`SystemModstamp`) | P (portal edit) | Case | Current city |
+   |--|--|--|--|--|--|
+   | A | 08:00 (echo of our last city send) | 10:00 (sales changed city, webhook lost) | 10:30 (finance edit queued while SF was down) | `10:30 > 10:00:01` → portal provably later | finance value. Salesforce is overwritten. The sales value stays in history. |
+   | B | 08:00:00 (echo of send #1) | 10:00 | 07:59:30 (finance edit #2, queued behind #1 because only one call per record is in flight) | `07:59:30 ≤ 07:59:59` → Salesforce provably later | sales value. Edit #2 is history only. |
+   | C | 08:00 | 10:00 | 09:00 (the review's example) | `08:00 < 09:00 ≤ 10:00` → unprovable | finance value, flagged. |
+
+   On C, honestly: if the sales edit really was at 10:00, Salesforce should win, and the default picks wrong. The change is that we now *say* it is unprovable and flag it. Only Q19 (field history) resolves it.
+
+   If E is a snapshot and the field has **no** unsent portal edit, E goes through steps 4–7 with stamp `(M, snap id)`.
 4. **No state yet.** If S is absent, insert the row from E. History `applied`.
 5. **Older or equal stamp.** If `E.stamp ≤ S.stamp`: no change. History `superseded`.
 6. **Same value.** If `E.stamp > S.stamp` and `E.value = S.value`: advance the stamp, keep `actor` and `changed_at`. History `equal_value`. The stamp must advance, or a late event with a stamp between the old and new stamp would wrongly apply.
@@ -196,7 +229,23 @@ Load: 30 webhooks/s at peak × ~3 statements per field. That is well inside one 
 - **Same field, opposite sides:** the higher stamp wins (merge step 7), and the loser stays in `field_events` with `superseded`. The two copies then converge:
   - *Portal wins.* `value ≠ sf_value`, so the outbox sends it and Salesforce ends on the portal value.
   - *Salesforce wins.* `value = sf_value`, so the worker finds nothing to send for that field and the queued portal value is never sent.
-  - *Sales edit while our PATCH is in flight.* Handled by `If-Unmodified-Since` (§6).
+  - *Sales edit while our PATCH is in flight.* Handled by `If-Unmodified-Since` (§6), plus the collision check below.
+
+**Collision check (verification read).** The guard has two gaps: `If-Unmodified-Since` has only 1 s resolution, and Q8 may be false. To cover them, the inbound path runs one extra check:
+- **Trigger.** A **non-echo** webhook (`changedBy ≠` integration user) for a record that is either in flight (its outbox row is `in_flight`) or inside the window `records.last_send_ack_at > now() − 10 s`.
+- **Action.** The endpoint runs `INSERT INTO verify_queue (portal_id) … ON CONFLICT DO NOTHING`, so a record has at most one pending read.
+- **Read.** The worker later issues one `GET /sobjects/{Type}/{sfId}` for the 8 in-scope fields plus `SystemModstamp`. The result is applied as a snapshot (merge step 3).
+- **Result.** If Salesforce ended on an older value than `field_state.value`, then `value ≠ sf_value` and the worker re-sends. Otherwise nothing changes.
+
+Echoes must be excluded from the trigger, because every send produces one echo: that alone would be +20 reads/s. `verify_queue` is a separate table from `outbox` because it holds only read-only calls. The inbound path therefore still never queues a *write* to Salesforce (loop layer a).
+
+**Cost of the collision check, against the cap:**
+- Records inside a window at peak: 20 sends/s × (0.5 s in flight + 10 s) = **210 records**.
+- If sales edits are spread uniformly over 5 M records: 30 webhooks/s × 210 / 5,000,000 = **0.0013 reads/s**.
+- Worst case, where every recently sent record is edited again by sales: the per-record `verify_queue` primary key bounds reads by sends, so ≤ **20 reads/s**.
+- We **cap verification at 5 reads/s** with a sub-bucket inside the main limiter. Overflow waits in `verify_queue`, and the next reconciliation also covers it.
+- Steady state: (20 writes + 5 reads) / 70 = **35.7 %** of the target (was 28.6 %). The 30 s bound still holds.
+- **This changes the drain arithmetic (§10).** Catch-up at 95/s now spends 20 on live writes and 5 on verification, leaving 70/s for the backlog: 432,000 / 70 = 6,171 s = **102.9 min** (was 96 min). With 5 % retries: 95 × 0.95 − 25 = 65.25/s → 432,000 / 65.25 = 6,621 s = **110.3 min**. Unused verification tokens return to the drain, so these are upper bounds.
 - **Opposite case: equal stamps.** Both time and event id equal means it is the same event, which the inbox rejects first. Equal times with different ids are ordered by the id string. That order is arbitrary but deterministic, so every replica decides the same way.
 
 ## 8. Duplicate webhook; older webhook after a newer one
