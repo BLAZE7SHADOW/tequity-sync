@@ -87,8 +87,8 @@ Shared code, `applyFieldEvents(tx, recordKey, events[])`, is the **only** functi
 5. **Durable outbound queue.** "Pending calls survive restart" is a hard requirement. Needs: the `outbox` table written in the portal's save transaction, plus leases. Adds the **worker** deployable.
 6. **Rate limiter, backoff, breaker.** The cap counts retries, so the limiter must wrap every attempt. Needs: an in-process token bucket in the single leader. Adds the **advisory lock** (leader election without new infrastructure).
 7. **Creates and ID mapping.** Retried creates must not duplicate, and a create's echo must find its row. Needs: `Portal_Id__c` upsert and `portalId` in the webhook.
-8. **Outage recovery.** Drain plus reconciliation of lost webhooks. Needs: the `sync_state.watermark` and query API (Q3). Built late because it reuses 2, 4 and 5 unchanged.
-9. **Observability.** Three paging metrics (§11).
+8. **Outage recovery.** Drain plus reconciliation of lost webhooks. Needs: the `sync_state.watermark` and query API (Q3). Built late because it reuses 2, 5 and 6 unchanged.
+9. **Observability.** Three paging metrics plus measured clock skew (§11).
 
 Rejected components: no Kafka, no Redis, no separate queue. Postgres already has the transactional write we need: the outbox row commits with the edit or not at all. At 20 rows/s the outbox is ~1.7 M rows/day at sustained peak, which is trivial for Postgres.
 
@@ -215,9 +215,10 @@ Endpoint `POST /webhooks/salesforce`, any replica:
    - c. `SELECT … FROM records WHERE portal_id=$1 FOR UPDATE`. This serialises all writers of one record: replicas, the portal API and the worker.
    - d. For each field, run `merge(S, E)` (§4), with `E = {value, stamp=(occurredAt, eventId), actor=changedBy, source='salesforce'}`. Append one `field_events` row per field, always, whatever the outcome.
    - e. `UPDATE records SET sf_modstamp = GREATEST(sf_modstamp, $systemModstamp)`.
+   - f. **Collision trigger** (§7). If `changedBy ≠` integration user, and either the record's outbox row is `in_flight` or `last_send_ack_at > now() − 10 s`: `INSERT INTO verify_queue … ON CONFLICT DO NOTHING`. This is a read-only request, not a write.
 5. **Commit, then answer.** `COMMIT` → `200`. Any database error → `ROLLBACK` → `503`. The inbox row rolls back too, so Salesforce's retry is applied, not mistaken for a duplicate.
 
-**The inbound path never inserts into `outbox`.** This is loop layer (a), §9.
+**The inbound path never inserts into `outbox`** (it may insert into `verify_queue`, which only ever causes a GET). This is loop layer (a), §9.
 
 Load: 30 webhooks/s at peak × ~3 statements per field. That is well inside one Postgres primary. The endpoint holds no state, so replicas are added for availability, not throughput.
 
