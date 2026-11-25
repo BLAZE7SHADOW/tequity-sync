@@ -411,3 +411,25 @@ Our own echo is neither, so it cannot start a write. Three layers:
 The table's values are upper bounds, apart from the retry row. Coalescing only shortens the drain. Unused verification tokens flow back into the drain.
 
 **What we cannot recover.** For a record changed in Salesforce during the window whose webhooks were lost, reconciliation returns only the **latest** value, `LastModifiedById` and `SystemModstamp`. Intermediate Salesforce values from the window, and their authors, are **not recoverable** without field history (Q19). Our history records the reconciled value as `source='snapshot'`. If Salesforce later delivers delayed webhooks, they are applied normally. Older ones become `superseded`, which *adds* the missing intermediate history.
+
+## 11. Numbers we watch, and when we call someone
+
+| # | Number (how it is computed) | Normal | Page when | Why that value |
+|--|--|--|--|--|
+| 1 | **Oldest unsent outbox age** = `now() − min(created_at)` over `status IN ('pending','in_flight')` | ≈ 1 s (§6D) | **> 20 s for 5 min** while the breaker is closed | 20 s leaves 10 s before the 30 s bound is broken. 5 min filters out a single slow retry chain. While the breaker is open, page instead on **breaker open > 5 min**: that is the outage itself. |
+| 2 | **Salesforce call rate**, every call counted at `limiter.take()`, and **429s per minute** | 25/s (20 writes + verification) | **> 85/s for 5 min in steady mode**, or **≥ 10 × 429 in a minute** | At a 70/s target, a sustained 85/s means something is bypassing the target (a retry storm or a bug). Repeated 429s mean Salesforce sees a different budget than ours, for example another integration sharing the org's limit. |
+| 3 | **Minutes since the last webhook** | seconds | **> 10 min, 09:00–19:00 client time** | Quiet hour = 1 edit/s, × 0.6 from Salesforce = 360 expected webhooks in 10 min. Seeing none is not chance: delivery is broken or our endpoint is rejecting. Runs reconciliation automatically, as well as paging. |
+| 4 | **Clock skew**: 5-min median of `max(0, t_send − occurredAt, occurredAt − t_ack)` over our echoes (Q6) | 0 s | **> 1 s for 10 min** | 1 s = ε. Above it, interval-rule verdicts (§4 step 3) and cross-side same-field ordering can be wrong. Automatic action: set ε = 2 × measured skew until fixed. |
+
+Also paged, but not part of the three-plus-one: **any `dead` outbox row** (an edit that will not reach Salesforce without a human), and `inbox_payload_mismatch`. Not paged, reviewed daily: count of `field_state.conflict = true` (unprovable fields awaiting a reviewer).
+
+## 12. Left out of this weekend's work
+
+- **Deletes and Salesforce record merges** (out of scope per the brief). A merged Account would orphan Contacts' `customer` ids, and a delete would leave `outbox` rows that 404 into `dead`.
+- **The conflict-review UI.** The data exists (`conflict` flag, both values in `field_events`). The screen does not.
+- **Bulk / Composite API.** These are the main lever if the drain must be faster: 25 records per Composite call would divide the 102.9 min by up to 25. Not assumed, so not used in the arithmetic.
+- **Verifying assumptions Q3, Q8, Q9, Q14 and Q19 against a real org**, and a load test against real Salesforce (out of scope).
+- **Postgres HA, backups, a second region.** Assumed managed, with a single primary.
+- **Owner-id mapping maintenance** (Q12), field-level security, PII encryption at rest, and secret rotation for the webhook HMAC.
+- **History retention / partitioning** (Q16) and schema evolution of the webhook payload.
+- **Per-field permissions** (who may edit which field on each side), and validation parity with Salesforce rules. Today a Salesforce validation rule rejection becomes a `dead` row.
