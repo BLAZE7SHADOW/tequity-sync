@@ -46,9 +46,9 @@ export class FakeSalesforce {
     return this.webhook(rec, fields, user, at);
   }
   /** A sales user creates a record. */
-  salesCreate(type: string, fields: Record<string, unknown>, user: string): Webhook {
+  salesCreate(type: string, fields: Record<string, unknown>, user: string, at = Date.now()): Webhook {
     const id = (type === 'Contact' ? '003' : '001') + randomUUID().replace(/-/g, '').slice(0, 12);
-    const rec: SfRecord = { id, type, portalId: null, fields: { ...fields }, systemModstamp: Date.now(), lastModifiedBy: user };
+    const rec: SfRecord = { id, type, portalId: null, fields: { ...fields }, systemModstamp: at, lastModifiedBy: user };
     this.records.set(id, rec);
     return this.webhook(rec, fields, user, rec.systemModstamp);
   }
