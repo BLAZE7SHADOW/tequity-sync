@@ -1,0 +1,16 @@
+{
+  "name": "tequity-sync-demo",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Demo of the two-way sync rules in docs/design.md against a fake Salesforce.",
+  "engines": { "node": ">=20.6" },
+  "scripts": {
+    "demo": "tsx scripts/demo.ts",
+    "test": "node --import tsx --test test/*.test.ts"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "tsx": "4.23.15"
+  }
+}
