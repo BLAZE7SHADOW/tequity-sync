@@ -90,3 +90,92 @@ Shared code, `applyFieldEvents(tx, recordKey, events[])`, is the **only** functi
 9. **Observability.** Three paging metrics (§11).
 
 Rejected components: no Kafka, no Redis, no separate queue. Postgres already has the transactional write we need: the outbox row commits with the edit or not at all. At 20 rows/s the outbox is ~1.7 M rows/day at sustained peak, which is trivial for Postgres.
+
+## 4. The data we store (Postgres)
+
+```sql
+CREATE TABLE records (
+  portal_id    uuid PRIMARY KEY,              -- = Portal_Id__c in Salesforce
+  sf_id        text UNIQUE,                   -- NULL until our create is acked
+  object_type  text NOT NULL CHECK (object_type IN ('Account','Contact')),
+  sf_modstamp  timestamptz                    -- latest SystemModstamp seen; base for If-Unmodified-Since
+);
+
+CREATE TABLE field_state (                    -- one row per (record, field): the CURRENT value
+  portal_id      uuid  REFERENCES records,
+  field          text,                        -- name|status|owner|full_name|phone|email|city|customer
+  value          jsonb,
+  stamp_time     timestamptz NOT NULL,        -- ORDERING key, part 1
+  stamp_event_id text        NOT NULL,        -- ORDERING key, part 2 (tie-break)
+  actor          text        NOT NULL,        -- who last CHANGED the value
+  changed_at     timestamptz NOT NULL,        -- when the value last changed (display)
+  source         text NOT NULL,               -- portal | salesforce | snapshot
+  sf_value       jsonb,                       -- last value we know Salesforce holds
+  sf_stamp       timestamptz,                 -- occurredAt / ack time of sf_value
+  PRIMARY KEY (portal_id, field)
+);
+
+CREATE TABLE field_events (                   -- append-only history; never UPDATE/DELETE
+  id          bigserial PRIMARY KEY,
+  portal_id   uuid, field text, value jsonb,
+  stamp_time  timestamptz, event_id text, actor text, source text,
+  outcome     text NOT NULL,  -- applied | superseded | equal_value | echo_ack | rejected_409 | pending_wins
+  recorded_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE inbox_events (event_id text PRIMARY KEY, received_at timestamptz, payload jsonb);
+
+CREATE TABLE outbox (                         -- "this record has portal edits Salesforce lacks"
+  id            bigserial PRIMARY KEY,
+  portal_id     uuid NOT NULL,
+  status        text NOT NULL DEFAULT 'pending', -- pending | in_flight | done | dead
+  attempts      int  NOT NULL DEFAULT 0,
+  next_attempt_at timestamptz NOT NULL DEFAULT now(),
+  lease_until   timestamptz,
+  last_error    text,
+  created_at    timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX outbox_ready ON outbox (next_attempt_at) WHERE status = 'pending';
+
+CREATE TABLE sync_state (key text PRIMARY KEY, value jsonb);  -- reconcile watermark, breaker
+```
+
+- `customer` on a Contact is stored as the Salesforce Account Id string, with no foreign key. It is resolved at read time, because the Contact may arrive before its Account (Q18).
+- **History is the full sequence of `field_events` rows**, including losers, echoes and rejected saves. "Who changed the city" = `actor` on the `field_state` row. "Who changed it before" = earlier rows with `outcome='applied'`.
+- **Stamp.** `stamp = (stamp_time, stamp_event_id)`, compared as a pair: time first, then the event id as a string. The two sides set it as follows:
+  - Webhook: `(occurredAt, eventId)`.
+  - Portal save: `(clock_timestamp() at write time, 'p_'+uuidv7)`.
+  - Snapshot or reconciliation: `(SystemModstamp, 'snap_'+sfId+'_'+SystemModstamp)`.
+- **The outbox row does not store values.** It only marks the record dirty. At send time the worker computes what to send from `field_state` (§6). An outbox row therefore never carries a stale value, and repeated edits to one record merge into one call.
+- Size: 5 M records × ~5 fields ≈ 25 M `field_state` rows. `field_events` grows ≤ 4.32 M rows/day at sustained peak (Q16).
+
+### Merge rule (pure function; the only writer of `field_state.value`)
+
+`merge(S, E)`: S is the current `field_state` row (possibly absent), E is an incoming field event. The steps run in order and the first match wins.
+
+1. **Echo.** If `E.source='salesforce'` and `E.actor = integration@tequity.example`: set `sf_value=E.value`, `sf_stamp=E.stamp_time`. Leave `value`, `actor` and stamp unchanged. History `echo_ack`.
+2. **Track Salesforce.** For any other Salesforce or snapshot event with `E.stamp_time > sf_stamp`: set `sf_value=E.value`. This happens whatever step 3 decides.
+3. **Pending wins.** This step applies only to a snapshot (full-record or reconciliation) event whose field also has an unsent portal edit. "Unsent" means `S.source='portal'` and `S.value ≠ sf_value`.
+   - Keep `value`.
+   - Record history `pending_wins`.
+   - Increment the `reconcile_conflicts` counter.
+
+   Why: the portal edit has a true per-field time, and the snapshot only has a record-level time (agreed at the Phase 2 review).
+4. **No state yet.** If S is absent, insert the row from E. History `applied`.
+5. **Older or equal stamp.** If `E.stamp ≤ S.stamp`: no change. History `superseded`.
+6. **Same value.** If `E.stamp > S.stamp` and `E.value = S.value`: advance the stamp, keep `actor` and `changed_at`. History `equal_value`. The stamp must advance, or a late event with a stamp between the old and new stamp would wrongly apply.
+7. **Newer stamp.** Otherwise (`E.stamp > S.stamp`): set `value`, the stamp, `actor`, `changed_at` and `source` from E. History `applied`.
+
+The SQL form of steps 5–7 is one statement, so concurrent replicas cannot interleave:
+`INSERT … ON CONFLICT (portal_id, field) DO UPDATE SET … WHERE (field_state.stamp_time, field_state.stamp_event_id) < (EXCLUDED.stamp_time, EXCLUDED.stamp_event_id)`. If 0 rows are updated, the outcome is `superseded`.
+
+## 7. The rule when both sides change the same record
+
+- **Different fields, any sides:** each field has its own `field_state` row and its own stamp, so both edits survive. Brief example: finance sets city=Noida at 11:00, sales sets phone at 11:30. The rows are independent and both values stay current. `city.actor=finance.user`, `phone.actor=sales.user`.
+- **Same field, both on the portal:** optimistic check on `baseStamps` → the second save gets `409`. Its attempt is recorded `rejected_409`. Only the first is ever sent to Salesforce (Q4).
+- **Same field, both in Salesforce:** Salesforce decides its own value. We order its webhooks by `occurredAt` (§8).
+- **Same field, opposite sides:** the higher stamp wins (merge step 7), and the loser stays in `field_events` with `superseded`. The two copies then converge:
+  - *Portal wins.* `value ≠ sf_value`, so the outbox sends it and Salesforce ends on the portal value.
+  - *Salesforce wins.* `value = sf_value`, so the worker finds nothing to send for that field and the queued portal value is never sent.
+  - *Sales edit while our PATCH is in flight.* Handled by `If-Unmodified-Since` (§6).
+- **Opposite case: equal stamps.** Both time and event id equal means it is the same event, which the inbox rejects first. Equal times with different ids are ordered by the id string. That order is arbitrary but deterministic, so every replica decides the same way.
