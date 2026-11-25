@@ -28,3 +28,65 @@ Each row: the question I would ask before locking the design, the assumption I c
 | Q18 | Can a Contact arrive before its Account? | Yes (any order). `customer` is stored as the Salesforce Account ID string, no FK; resolved at read time. | — |
 
 Decision on the brief's "Pick one": **delta webhooks** (Q2), with the snapshot rule as the defined behaviour for the other case.
+
+## 2. Systems, callers, boundary, interfaces
+
+```
+  Sales user                                   Finance / CS user
+      | (browser)                                     | (browser, authenticated session)
+      v                                               v
+ +-----------------+                       +-----------------------------+
+ | Salesforce      |                       | Portal API (existing app)   |
+ | (their DB)      |                       |  PATCH /records/{type}/{id} |
+ +-----------------+                       +-------------+---------------+
+   |          ^                                          | one txn: field_state,
+   | (A)      | (B) record API                           | field_events, outbox
+   | webhook  | PATCH / upsert / query                   v
+   | HTTPS    | HTTPS, <=100 req/s          +-----------------------------+
+   |          |                             |          Postgres           |
+===|==========|=== public internet =========|  records  field_state       |
+   |          |    (only path: HTTPS)       |  field_events inbox_events  |
+   v          |                             |  outbox   sync_state        |
+ +----------------------+   writes          +-----------------------------+
+ | Webhook endpoint     |------------------>      ^            ^
+ | stateless, N replicas|  inbox_events,          |            | claim/ack outbox,
+ +----------------------+  field_state,           |            | write sf_value,
+                            field_events          |            | reconcile
+              +-----------------------------------+------------+
+              | Sync worker: single leader (pg_try_advisory_lock(42)),     |
+              | token bucket, backoff, breaker, reconciliation             |
+              +------------------------------------------------------------+
+                          | (B) calls Salesforce
+```
+
+**Choice: one codebase, two deployables.** The webhook endpoint must answer fast and scale horizontally. The worker must be the single owner of the rate budget, because a token bucket split across replicas cannot honour one cap without coordination. The two never call each other. **What crosses between them is the Postgres schema, not only the outbox.** The starting brief said "only the outbox", which is wrong: the worker reads `field_state` to build each call and writes `sf_value` after a success. Ownership per table:
+
+| Table | Written by | Read by |
+|-------|-----------|---------|
+| `inbox_events` | endpoint; worker (reconciliation / 412 re-read use the same apply function) | — |
+| `field_state` | endpoint (`value`, stamp, actor, `sf_value`), portal API (`value`, stamp, actor), worker (`sf_value`, `sf_modstamp` only) | all |
+| `field_events` | all three, append-only | portal UI (history) |
+| `outbox` | portal API (insert), worker (lease, status) | worker |
+| `sync_state` | worker (watermark, breaker state) | worker |
+
+Shared code, `applyFieldEvents(tx, recordKey, events[])`, is the **only** function that changes `field_state.value`. The endpoint, the portal API and the worker's reconciliation all call it (§4 rule).
+
+**Interface (A), Salesforce → us.** `POST /webhooks/salesforce`, JSON as in the brief plus `systemModstamp` and `portalId` (Q14). Headers `X-Signature`, `X-Timestamp`. Responses: `200` applied or duplicate; `400` schema invalid (logged, Salesforce should not retry); `401` bad signature; `503` database unavailable (Salesforce retries). Never `200` before commit.
+
+**Interface (portal), user → portal API.** `PATCH /records/{objectType}/{portalId}`, body `{changedFields:{city:"Noida"}, baseStamps:{city:"<event_id the form loaded>"}}`. Responses: `200` with new stamps; `409` `{field, currentValue, changedBy, changedAt}` per stale field (the whole save is rejected, so a form is never half-applied); `400` if `editedBy` ≠ session user.
+
+**Interface (B), us → Salesforce.** Our assumption of the record API: `PATCH /sobjects/{Type}/{sfId}` with header `If-Unmodified-Since: <sf_modstamp>`; `PATCH /sobjects/{Type}/Portal_Id__c/{portalId}` (create-or-update by External ID); `GET /query?q=SELECT … WHERE SystemModstamp >= …`. Outcomes: `2xx` ack; `412` re-read and re-merge; `429`/`503` + `Retry-After` slow down and keep the row; other `4xx` dead-letter the row and alert; timeout/connection error retry with backoff.
+
+## 3. Subproblems, in build order (risk first)
+
+1. **Per-field merge and ordering** (pure function `merge(state, event) → {state', historyRow}`). Riskiest because every path calls it, and a bug loses data silently with no error. Cheapest to prove: unit tests, no I/O. Needs: the stamp definition. No component.
+2. **Idempotent inbound apply** (duplicate and out-of-order in one transaction). Second because Salesforce *will* duplicate and reorder from day one. Needs: `inbox_events` (PK `event_id`) and a conditional upsert.
+3. **Loop prevention.** A loop costs the rate budget at 2× per bounce and corrupts the actor. Must exist before the worker sends anything. Needs: integration-user identity and the `sf_value` column. No component.
+4. **Durable outbound queue.** "Pending calls survive restart" is a hard requirement. Needs: the `outbox` table written in the portal's save transaction, plus leases. Adds the **worker** deployable.
+5. **Rate limiter, backoff, breaker.** The cap counts retries, so the limiter must wrap every attempt. Needs: an in-process token bucket in the single leader. Adds the **advisory lock** (leader election without new infrastructure).
+6. **Cross-side race on an in-flight update** (sales edit lands while our PATCH is queued). Needs: `If-Unmodified-Since` (Q8) and the 412 path.
+7. **Creates and ID mapping.** Retried creates must not duplicate, and a create's echo must find its row. Needs: `Portal_Id__c` upsert and `portalId` in the webhook.
+8. **Outage recovery.** Drain plus reconciliation of lost webhooks. Needs: the `sync_state.watermark` and query API (Q3). Built late because it reuses 2, 4 and 5 unchanged.
+9. **Observability.** Three paging metrics (§11).
+
+Rejected components: no Kafka, no Redis, no separate queue. Postgres already has the transactional write we need: the outbox row commits with the edit or not at all. At 20 rows/s the outbox is ~1.7 M rows/day at sustained peak, which is trivial for Postgres.
