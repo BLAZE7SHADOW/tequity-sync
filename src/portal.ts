@@ -37,7 +37,13 @@ export function portalSave(store: Store, sessionUser: string,
       return { status: 409, conflicts };
     }
     const eventId = `p_${randomUUID()}`;
-    applyFieldEvents(db, req.portalId, fields.map((field) => ({ field, ev: { value: req.changedFields[field], stampTime: now, eventId, actor: sessionUser, source: 'portal' as const } })));
+    // Monotonic per field: the base check proved the user saw the current value, so this save must win
+    // even if it lands in the same clock tick (design §4 "Stamp"). GREATEST(now, current + 1 ms).
+    applyFieldEvents(db, req.portalId, fields.map((field) => {
+      const cur = db.fields[fieldKey(req.portalId, field)];
+      const stampTime = Math.max(now, (cur?.stampTime ?? 0) + 1);
+      return { field, ev: { value: req.changedFields[field], stampTime, eventId, actor: sessionUser, source: 'portal' as const } };
+    }));
     upsertOutbox(db, req.portalId, now);
     return { status: 200, stamps: Object.fromEntries(fields.map((f) => [f, eventId])) };
   });

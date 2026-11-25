@@ -159,7 +159,7 @@ CREATE TABLE sync_state (key text PRIMARY KEY, value jsonb);  -- reconcile water
 - **History is the full sequence of `field_events` rows**, including losers, echoes and rejected saves. "Who changed the city" = `actor` on the `field_state` row. "Who changed it before" = earlier rows with `outcome='applied'`.
 - **Stamp.** `stamp = (stamp_time, stamp_event_id)`, compared as a pair: time first, then the event id as a string. The two sides set it as follows:
   - Webhook: `(occurredAt, eventId)`.
-  - Portal save: `(clock_timestamp() at write time, 'p_'+uuidv7)`.
+  - Portal save: `(GREATEST(clock_timestamp(), current stamp_time + 1 µs), 'p_'+uuidv7)`, taken under the record lock. The `GREATEST` makes it monotonic per field. The 409 check already proved the user saw the current value, so the save must win even inside the same clock tick. Without it, the random part of the id would decide, and the save could be `superseded` while returning 200. *Found by the demo's unit test in Phase 9; doc and code fixed together.* (The demo uses 1 ms.)
   - Snapshot or reconciliation: `(SystemModstamp, 'snap_'+sfId+'_'+SystemModstamp)`. Actor = `LastModifiedById` mapped via Q12, marked approximate by `source='snapshot'`: it is the record's last modifier, not necessarily this field's.
   - **The field that decides which edit is current:** `stamp_time`, which is `occurredAt` on a webhook and the Postgres commit-time `clock_timestamp()` on a portal save, with `stamp_event_id` as the tie-break.
 - **The outbox row does not store values.** It only marks the record dirty. At send time the worker computes what to send from `field_state` (§6). An outbox row therefore never carries a stale value, and repeated edits to one record merge into one call.
@@ -239,7 +239,7 @@ Load: 30 webhooks/s at peak × ~3 statements per field. That is well inside one 
 **A. Portal save (portal API, one transaction).**
 1. `SELECT … FROM records WHERE portal_id=$1 FOR UPDATE`.
 2. For each field in `changedFields`, compare `baseStamps[field]` with `field_state.stamp_event_id`. Any mismatch → `ROLLBACK`, `409` for the whole save, plus one `rejected_409` history row per field (written in a separate short transaction).
-3. Set the stamp to `(clock_timestamp(), 'p_'+uuidv7())`. Set the actor to the session user. Run `merge` (§4) and append `field_events`.
+3. Set the stamp to `(GREATEST(clock_timestamp(), current stamp_time + 1 µs), 'p_'+uuidv7())` per field (§4 Stamp). Set the actor to the session user. Run `merge` (§4) and append `field_events`.
 4. `INSERT INTO outbox (portal_id) VALUES ($1) ON CONFLICT … DO UPDATE`. On conflict: `UPDATE SET last_save_at = now()`. A partial unique index `ON outbox(portal_id) WHERE status='pending'` keeps it to one pending row per record. If a row is already `in_flight`, the new pending row is the "send again afterwards".
 5. `COMMIT` → `200`. The edit and its outbox row commit together or not at all.
 
